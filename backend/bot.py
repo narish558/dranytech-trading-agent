@@ -51,7 +51,7 @@ SPOT_TEST    = "https://testnet.binance.vision"
 FUTURES_TEST = "https://testnet.binancefuture.com"
 
 ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL  = "claude-opus-4-5"
+CLAUDE_MODEL  = "claude-sonnet-4-6"
 
 AI_SYSTEM = """You are an expert cryptocurrency trading AI agent managing a real Binance account.
 Analyze live market data and decide BUY, SELL, or HOLD for each asset.
@@ -273,7 +273,7 @@ def run_ai_cycle(pairs):
     }
     payload = {
         "model":      CLAUDE_MODEL,
-        "max_tokens": 1024,
+        "max_tokens": 2048,
         "system":     AI_SYSTEM,
         "messages":   [{"role": "user", "content": user_msg}],
     }
@@ -281,7 +281,9 @@ def run_ai_cycle(pairs):
     log("Sending market data to Claude AI...", "info")
     try:
         resp = requests.post(ANTHROPIC_API, headers=headers, json=payload, timeout=30)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            log(f"Claude API error {resp.status_code}: {resp.text[:300]}", "error")
+            return None
         raw = resp.json()["content"][0]["text"].strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
