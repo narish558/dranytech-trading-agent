@@ -173,6 +173,27 @@ def refresh_balances():
     except Exception as e:
         log(f"Balance refresh error: {e}", "error")
 
+def get_lot_size(symbol, market="spot"):
+    """Fetch min qty and step size for a symbol from Binance exchange info."""
+    try:
+        path = "/api/v3/exchangeInfo" if market == "spot" else "/fapi/v1/exchangeInfo"
+        r = requests.get(base_url(market) + path, params={"symbol": symbol}, timeout=8)
+        data = r.json()
+        for s in data.get("symbols", []):
+            if s["symbol"] == symbol:
+                for f in s.get("filters", []):
+                    if f["filterType"] == "LOT_SIZE":
+                        return float(f["minQty"]), float(f["stepSize"])
+    except Exception as e:
+        log(f"LOT_SIZE fetch error: {e}", "warn")
+    return 0.001, 0.001  # safe fallback
+
+def round_step(qty, step):
+    """Round quantity down to nearest step size."""
+    import math
+    decimals = len(str(step).rstrip('0').split('.')[-1]) if '.' in str(step) else 0
+    return round(math.floor(qty / step) * step, decimals)
+
 def place_order(rule, price):
     symbol = rule["pair"].replace("/", "")
     market = rule["market"].lower()
@@ -190,7 +211,17 @@ def place_order(rule, price):
         log(f"Blocked: max open trades reached.", "warn")
         return None
 
-    qty  = round(amount / price, 6)
+    # Get correct lot size rules from Binance
+    min_qty, step_size = get_lot_size(symbol, market)
+    raw_qty = amount / price
+    qty = round_step(raw_qty, step_size)
+
+    # Check minimum quantity
+    if qty < min_qty:
+        log(f"Blocked: qty {qty} below Binance minimum {min_qty} for {symbol}. Increase trade amount.", "warn")
+        return None
+
+    log(f"Order: {side} {qty} {symbol} (min={min_qty}, step={step_size})", "info")
     params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": qty}
     if market == "futures":
         params["reduceOnly"] = "false"
