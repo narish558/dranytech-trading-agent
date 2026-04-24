@@ -1,10 +1,12 @@
 """
-Binance Claude AI Trading Agent — Backend
-Render-ready: reads credentials from environment variables.
+DranyTech AI Trading Agent — Backend
+Single-file, Render-ready. No external local imports.
 """
 
 import os
+import sys
 import time
+import json
 import hmac
 import hashlib
 import requests
@@ -12,28 +14,26 @@ import threading
 from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from ai_agent import run_ai_cycle
 
 app = Flask(__name__)
-CORS(app, origins="*")  # Allow all origins (frontend can be hosted anywhere)
+CORS(app, origins="*")
 
 # ── State ──────────────────────────────────────────────────────────────────────
 state = {
-    # Credentials — loaded from env vars on startup, or set via /connect
-    "api_key":        os.environ.get("BINANCE_API_KEY", ""),
-    "api_secret":     os.environ.get("BINANCE_API_SECRET", ""),
-    "anthropic_key":  os.environ.get("ANTHROPIC_API_KEY", ""),
-    "testnet":        os.environ.get("TESTNET", "false").lower() == "true",
-    "connected":      False,
-    "agent_running":  False,
-    "agent_mode":     "hybrid",
-    "rules":          [],
-    "log":            [],
-    "trades":         [],
-    "balances":       [],
-    "ai_decisions":   [],
-    "pnl_today":      0.0,
-    "daily_loss":     0.0,
+    "api_key":       os.environ.get("BINANCE_API_KEY", ""),
+    "api_secret":    os.environ.get("BINANCE_API_SECRET", ""),
+    "anthropic_key": os.environ.get("ANTHROPIC_API_KEY", ""),
+    "testnet":       os.environ.get("TESTNET", "false").lower() == "true",
+    "connected":     False,
+    "agent_running": False,
+    "agent_mode":    "hybrid",
+    "rules":         [],
+    "log":           [],
+    "trades":        [],
+    "balances":      [],
+    "ai_decisions":  [],
+    "pnl_today":     0.0,
+    "daily_loss":    0.0,
     "risk": {
         "max_trade_usdt":   200,
         "daily_loss_limit": 100,
@@ -50,32 +50,49 @@ FUTURES_BASE = "https://fapi.binance.com"
 SPOT_TEST    = "https://testnet.binance.vision"
 FUTURES_TEST = "https://testnet.binancefuture.com"
 
-# ── Auto-connect on startup if env vars are set ────────────────────────────────
-def try_auto_connect():
-    if state["api_key"] and state["api_secret"]:
-        try:
-            r = signed_request("GET", "spot", "/api/v3/account")
-            if r.status_code == 200:
-                state["connected"] = True
-                refresh_balances()
-                log("Auto-connected via environment variables.", "ok")
-                if state["anthropic_key"]:
-                    log("Claude AI key loaded from environment.", "ok")
-            else:
-                log(f"Auto-connect failed: {r.json().get('msg','unknown')}", "warn")
-        except Exception as e:
-            log(f"Auto-connect error: {e}", "warn")
-    else:
-        log("No env vars set. Connect via dashboard.", "info")
+ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
+CLAUDE_MODEL  = "claude-opus-4-6"
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+AI_SYSTEM = """You are an expert cryptocurrency trading AI agent managing a real Binance account.
+Analyze live market data and decide BUY, SELL, or HOLD for each asset.
+
+Respond ONLY with valid JSON in this exact format:
+{
+  "analysis": "Brief market analysis in 2-3 sentences",
+  "sentiment": "bullish | bearish | neutral",
+  "decisions": [
+    {
+      "pair": "BTC/USDT",
+      "market": "spot",
+      "action": "BUY | SELL | HOLD",
+      "amount_usdt": 100,
+      "confidence": 0.75,
+      "reason": "One sentence reason",
+      "stop_loss_pct": 3.0,
+      "take_profit_pct": 6.0
+    }
+  ],
+  "risk_warning": "Any specific risk warning, or null"
+}
+
+RULES:
+1. Never recommend amount_usdt above max_trade_usdt in risk settings
+2. Always include stop_loss_pct (min 2%, max 10%)
+3. Only output BUY/SELL when confidence >= 0.65
+4. Output HOLD when uncertain
+5. Never trade more than 3 pairs per cycle
+6. Capital preservation is the top priority
+"""
+
+# ── Logging ────────────────────────────────────────────────────────────────────
 def log(msg, level="info"):
-    entry = {"time": datetime.now().strftime("%H:%M:%S"), "msg": msg, "level": level}
+    entry = {"time": datetime.now().strftime("%H:%M:%S"), "msg": str(msg), "level": level}
     state["log"].append(entry)
     if len(state["log"]) > 300:
         state["log"].pop(0)
-    print(f"[{entry['time']}][{level.upper()}] {msg}")
+    print(f"[{entry['time']}][{level.upper()}] {msg}", flush=True)
 
+# ── Binance helpers ────────────────────────────────────────────────────────────
 def base_url(market="spot"):
     if market == "futures":
         return FUTURES_TEST if state["testnet"] else FUTURES_BASE
@@ -85,7 +102,11 @@ def signed_request(method, market, path, params=None):
     params = params or {}
     params["timestamp"] = int(time.time() * 1000)
     query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    sig = hmac.new(state["api_secret"].encode(), query.encode(), hashlib.sha256).hexdigest()
+    sig = hmac.new(
+        state["api_secret"].encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
     query += f"&signature={sig}"
     url = base_url(market) + path + "?" + query
     headers = {"X-MBX-APIKEY": state["api_key"]}
@@ -101,6 +122,45 @@ def get_price(symbol, market="spot"):
     except Exception as e:
         log(f"Price error {symbol}: {e}", "error")
         return None
+
+def get_ticker_24h(symbol, market="spot"):
+    try:
+        path = "/api/v3/ticker/24hr" if market == "spot" else "/fapi/v1/ticker/24hr"
+        r = requests.get(base_url(market) + path, params={"symbol": symbol}, timeout=5)
+        d = r.json()
+        return {
+            "price":      float(d.get("lastPrice", 0)),
+            "change_pct": float(d.get("priceChangePercent", 0)),
+            "high":       float(d.get("highPrice", 0)),
+            "low":        float(d.get("lowPrice", 0)),
+            "volume":     float(d.get("quoteVolume", 0)),
+        }
+    except Exception:
+        return {}
+
+def get_klines(symbol, market="spot", interval="1h", limit=24):
+    try:
+        path = "/api/v3/klines" if market == "spot" else "/fapi/v1/klines"
+        r = requests.get(base_url(market) + path,
+                         params={"symbol": symbol, "interval": interval, "limit": limit},
+                         timeout=8)
+        return [float(c[4]) for c in r.json()]
+    except Exception:
+        return []
+
+def calc_rsi(closes):
+    if len(closes) < 14:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    ag = sum(gains[-14:]) / 14
+    al = sum(losses[-14:]) / 14
+    if al == 0:
+        return 100.0
+    return round(100 - (100 / (1 + ag / al)), 2)
 
 def refresh_balances():
     try:
@@ -119,16 +179,15 @@ def place_order(rule, price):
     side   = rule["side"]
     amount = float(rule["amount"])
 
-    # Risk gate checks
     if amount > state["risk"]["max_trade_usdt"]:
-        log(f"Blocked: ${amount} exceeds max ${state['risk']['max_trade_usdt']}", "warn")
+        log(f"Blocked: ${amount} > max ${state['risk']['max_trade_usdt']}", "warn")
         return None
     if state["daily_loss"] >= state["risk"]["daily_loss_limit"]:
-        log("Blocked: daily loss limit reached. Agent paused.", "warn")
+        log("Blocked: daily loss limit reached.", "warn")
         return None
     open_count = len([t for t in state["trades"] if not t.get("closed")])
     if open_count >= state["risk"]["max_open_trades"]:
-        log(f"Blocked: max open trades ({state['risk']['max_open_trades']}) reached.", "warn")
+        log(f"Blocked: max open trades reached.", "warn")
         return None
 
     qty  = round(amount / price, 6)
@@ -146,7 +205,7 @@ def place_order(rule, price):
             trade = {
                 "time":    datetime.now().strftime("%H:%M:%S"),
                 "pair":    rule["pair"],
-                "market":  rule["market"],
+                "market":  rule.get("market", "Spot"),
                 "side":    side,
                 "amount":  amount,
                 "price":   price,
@@ -158,11 +217,7 @@ def place_order(rule, price):
                 "closed":  False,
             }
             state["trades"].append(trade)
-            sl_price = price * (1 - float(sl) / 100) if side == "BUY" else price * (1 + float(sl) / 100)
-            log(f"FILLED: {side} {qty} {symbol} @ ${price:.4f} | SL=${sl_price:.4f} | ID={data['orderId']}", "ok")
-            if tp:
-                tp_price = price * (1 + float(tp) / 100) if side == "BUY" else price * (1 - float(tp) / 100)
-                log(f"Take-profit target: ${tp_price:.4f} ({tp}%)", "info")
+            log(f"FILLED: {side} {qty} {symbol} @ ${price:.4f} | ID={data['orderId']}", "ok")
             refresh_balances()
             return trade
         else:
@@ -171,6 +226,108 @@ def place_order(rule, price):
     except Exception as e:
         log(f"Order exception: {e}", "error")
         return None
+
+# ── Claude AI brain ────────────────────────────────────────────────────────────
+def run_ai_cycle(pairs):
+    if not state["anthropic_key"]:
+        log("No Claude API key set.", "warn")
+        return None
+
+    log(f"AI cycle: gathering data for {', '.join(pairs)}", "info")
+    market_data = {}
+    for pair in pairs:
+        symbol  = pair.replace("/", "")
+        ticker  = get_ticker_24h(symbol)
+        closes  = get_klines(symbol)
+        rsi     = calc_rsi(closes)
+        sma7    = round(sum(closes[-7:])  / min(7,  len(closes)), 4) if closes else None
+        sma24   = round(sum(closes[-24:]) / min(24, len(closes)), 4) if closes else None
+        market_data[pair] = {
+            **ticker,
+            "rsi_1h":  rsi,
+            "sma_7h":  sma7,
+            "sma_24h": sma24,
+            "trend":   "up" if (sma7 and sma24 and sma7 > sma24) else "down",
+        }
+
+    portfolio = {
+        b["asset"]: {"free": float(b["free"]), "locked": float(b["locked"])}
+        for b in state["balances"]
+    }
+
+    context = {
+        "timestamp":      datetime.utcnow().isoformat() + "Z",
+        "market_data":    market_data,
+        "portfolio":      portfolio,
+        "recent_trades":  state["trades"][-10:],
+        "risk_settings":  state["risk"],
+        "pairs_to_analyze": pairs,
+    }
+
+    user_msg = f"Analyze these live market conditions and give trading decisions:\n\n{json.dumps(context, indent=2)}\n\nRespond ONLY with the JSON format specified."
+
+    headers = {
+        "x-api-key":         state["anthropic_key"],
+        "anthropic-version": "2023-06-01",
+        "content-type":      "application/json",
+    }
+    payload = {
+        "model":      CLAUDE_MODEL,
+        "max_tokens": 1024,
+        "system":     AI_SYSTEM,
+        "messages":   [{"role": "user", "content": user_msg}],
+    }
+
+    log("Sending market data to Claude AI...", "info")
+    try:
+        resp = requests.post(ANTHROPIC_API, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        raw = resp.json()["content"][0]["text"].strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw.strip())
+    except Exception as e:
+        log(f"Claude API error: {e}", "error")
+        return None
+
+    log(f"Claude [{result.get('sentiment','?').upper()}]: {result.get('analysis','')}", "ok")
+    if result.get("risk_warning"):
+        log(f"Claude warning: {result['risk_warning']}", "warn")
+
+    for dec in result.get("decisions", []):
+        action     = dec.get("action", "HOLD")
+        pair       = dec.get("pair")
+        confidence = dec.get("confidence", 0)
+        reason     = dec.get("reason", "")
+        amount     = dec.get("amount_usdt", 0)
+        mkt        = dec.get("market", "spot")
+        sl         = dec.get("stop_loss_pct", 3.0)
+        tp         = dec.get("take_profit_pct", 6.0)
+
+        log(f"Decision: {action} {pair} | conf={confidence:.0%} | {reason}", "info")
+
+        if action == "HOLD" or confidence < 0.65:
+            log(f"HOLD {pair} — skipping.", "info")
+            continue
+
+        symbol = pair.replace("/", "")
+        ticker = get_ticker_24h(symbol)
+        price  = ticker.get("price")
+        if not price:
+            log(f"Cannot get price for {pair}", "error")
+            continue
+
+        rule = {
+            "pair": pair, "market": mkt.capitalize(),
+            "side": action, "amount": amount,
+            "sl": sl, "tp": tp, "ai_decision": True,
+        }
+        log(f"Executing AI trade: {action} ${amount} of {pair} @ ${price:.4f}", "ok")
+        place_order(rule, price)
+
+    return result
 
 # ── Rule Engine ────────────────────────────────────────────────────────────────
 def check_rule(rule):
@@ -198,11 +355,11 @@ def check_rule(rule):
             triggered = True
     log(f"Rule {rule['pair']}: ${price:.4f} | {trigger} {val} → {'HIT' if triggered else 'waiting'}")
     if triggered:
-        log(f"RULE TRIGGERED: {rule['side']} {rule['pair']}", "ok")
+        log(f"TRIGGER: {rule['side']} {rule['pair']}", "ok")
         place_order(rule, price)
         rule["triggered"] = True
 
-# ── Agent Loops ────────────────────────────────────────────────────────────────
+# ── Agent loops ────────────────────────────────────────────────────────────────
 def rule_loop():
     log("Rule engine started — checking every 30s.", "ok")
     while state["agent_running"] and state["agent_mode"] in ("rule", "hybrid"):
@@ -215,16 +372,7 @@ def ai_loop():
     log(f"Claude AI agent started — analyzing every {interval}s.", "ok")
     while state["agent_running"] and state["agent_mode"] in ("ai", "hybrid"):
         pairs  = state["risk"].get("ai_pairs", ["BTC/USDT", "ETH/USDT"])
-        result = run_ai_cycle(
-            pairs          = pairs,
-            base_url       = base_url("spot"),
-            balances       = state["balances"],
-            trades         = state["trades"],
-            risk           = state["risk"],
-            api_key        = state["anthropic_key"],
-            log_fn         = log,
-            place_order_fn = place_order,
-        )
+        result = run_ai_cycle(pairs)
         if result:
             state["ai_decisions"].append({
                 "time":      datetime.now().strftime("%H:%M:%S"),
@@ -238,33 +386,63 @@ def ai_loop():
         time.sleep(interval)
 
 def agent_runner():
+    mode = state["agent_mode"]
     threads = []
-    mode    = state["agent_mode"]
     if mode in ("rule", "hybrid"):
         t = threading.Thread(target=rule_loop, daemon=True)
-        t.start()
-        threads.append(t)
+        t.start(); threads.append(t)
     if mode in ("ai", "hybrid"):
         if not state["anthropic_key"]:
             log("No Claude API key — AI mode skipped.", "warn")
         else:
             t = threading.Thread(target=ai_loop, daemon=True)
-            t.start()
-            threads.append(t)
+            t.start(); threads.append(t)
     for t in threads:
         t.join()
 
-# ── API Routes ─────────────────────────────────────────────────────────────────
+def try_auto_connect():
+    if state["api_key"] and state["api_secret"]:
+        try:
+            r = signed_request("GET", "spot", "/api/v3/account")
+            if r.status_code == 200:
+                state["connected"] = True
+                refresh_balances()
+                log("Auto-connected via environment variables.", "ok")
+                if state["anthropic_key"]:
+                    log("Claude AI key loaded.", "ok")
+            else:
+                log(f"Auto-connect failed: {r.json().get('msg','unknown')}", "warn")
+        except Exception as e:
+            log(f"Auto-connect error: {e}", "warn")
+    else:
+        log("No API keys in environment. Connect via dashboard.", "info")
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "DranyTech AI Agent running", "connected": state["connected"]})
+
+@app.route("/status", methods=["GET"])
+def status():
+    return jsonify({
+        "connected":     state["connected"],
+        "testnet":       state["testnet"],
+        "agent_running": state["agent_running"],
+        "agent_mode":    state["agent_mode"],
+        "has_ai":        bool(state["anthropic_key"]),
+        "rule_count":    len(state["rules"]),
+        "trade_count":   len(state["trades"]),
+        "ai_decisions":  len(state["ai_decisions"]),
+        "pnl_today":     state["pnl_today"],
+        "daily_loss":    state["daily_loss"],
+    })
+
 @app.route("/connect", methods=["POST"])
 def connect():
-    d = request.json
-    # Only override env vars if explicitly provided in request
-    if d.get("api_key"):
-        state["api_key"] = d["api_key"]
-    if d.get("api_secret"):
-        state["api_secret"] = d["api_secret"]
-    if d.get("anthropic_key"):
-        state["anthropic_key"] = d["anthropic_key"]
+    d = request.json or {}
+    if d.get("api_key"):       state["api_key"]       = d["api_key"]
+    if d.get("api_secret"):    state["api_secret"]    = d["api_secret"]
+    if d.get("anthropic_key"): state["anthropic_key"] = d["anthropic_key"]
     state["testnet"] = d.get("testnet", state["testnet"])
     try:
         r = signed_request("GET", "spot", "/api/v3/account")
@@ -272,8 +450,6 @@ def connect():
             state["connected"] = True
             refresh_balances()
             log("Connected to Binance API.", "ok")
-            if state["anthropic_key"]:
-                log("Claude AI key active.", "ok")
             return jsonify({"ok": True, "has_ai": bool(state["anthropic_key"])})
         return jsonify({"ok": False, "msg": r.json().get("msg", "Auth failed")}), 400
     except Exception as e:
@@ -291,8 +467,7 @@ def prices():
     result = {}
     for p in ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]:
         px = get_price(p)
-        if px:
-            result[p] = px
+        if px: result[p] = px
     return jsonify({"ok": True, "prices": result})
 
 @app.route("/rules", methods=["GET"])
@@ -323,7 +498,7 @@ def start_agent():
     state["agent_mode"]    = d.get("mode", "hybrid")
     state["agent_running"] = True
     if d.get("ai_interval_sec"):
-        state["risk"]["ai_interval_sec"] = d["ai_interval_sec"]
+        state["risk"]["ai_interval_sec"] = int(d["ai_interval_sec"])
     threading.Thread(target=agent_runner, daemon=True).start()
     log(f"Agent started in [{state['agent_mode'].upper()}] mode.", "ok")
     return jsonify({"ok": True, "mode": state["agent_mode"]})
@@ -331,24 +506,15 @@ def start_agent():
 @app.route("/agent/stop", methods=["POST"])
 def stop_agent():
     state["agent_running"] = False
-    log("Agent stopped by user.", "warn")
+    log("Agent stopped.", "warn")
     return jsonify({"ok": True})
 
 @app.route("/agent/analyze", methods=["POST"])
 def manual_analyze():
     if not state["anthropic_key"]:
-        return jsonify({"ok": False, "msg": "Claude API key not configured"}), 400
-    pairs  = request.json.get("pairs", ["BTC/USDT", "ETH/USDT", "BNB/USDT"])
-    result = run_ai_cycle(
-        pairs          = pairs,
-        base_url       = base_url("spot"),
-        balances       = state["balances"],
-        trades         = state["trades"],
-        risk           = state["risk"],
-        api_key        = state["anthropic_key"],
-        log_fn         = log,
-        place_order_fn = place_order,
-    )
+        return jsonify({"ok": False, "msg": "Claude API key not set"}), 400
+    pairs  = (request.json or {}).get("pairs", ["BTC/USDT", "ETH/USDT", "BNB/USDT"])
+    result = run_ai_cycle(pairs)
     if result:
         state["ai_decisions"].append({
             "time":      datetime.now().strftime("%H:%M:%S"),
@@ -363,21 +529,6 @@ def manual_analyze():
 def ai_decisions():
     return jsonify({"ok": True, "decisions": state["ai_decisions"]})
 
-@app.route("/status", methods=["GET"])
-def status():
-    return jsonify({
-        "connected":     state["connected"],
-        "testnet":       state["testnet"],
-        "agent_running": state["agent_running"],
-        "agent_mode":    state["agent_mode"],
-        "has_ai":        bool(state["anthropic_key"]),
-        "rule_count":    len(state["rules"]),
-        "trade_count":   len(state["trades"]),
-        "ai_decisions":  len(state["ai_decisions"]),
-        "pnl_today":     state["pnl_today"],
-        "daily_loss":    state["daily_loss"],
-    })
-
 @app.route("/log", methods=["GET"])
 def get_log():
     return jsonify({"ok": True, "log": state["log"][-150:]})
@@ -388,19 +539,16 @@ def get_trades():
 
 @app.route("/risk", methods=["POST"])
 def set_risk():
-    state["risk"].update(request.json)
+    state["risk"].update(request.json or {})
     log("Risk settings updated.", "info")
     return jsonify({"ok": True})
 
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({"status": "Binance Claude AI Agent running", "connected": state["connected"]})
-
-# ── Startup ────────────────────────────────────────────────────────────────────
+# ── Start ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 55)
-    print("  Binance Claude AI Agent — Render-Ready Backend")
+    print("  DranyTech Claude AI Trading Agent")
     print("=" * 55)
+    sys.stdout.flush()
     threading.Thread(target=try_auto_connect, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
