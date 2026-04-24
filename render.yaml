@@ -1,11 +1,12 @@
 services:
   - type: web
-    name: binance-claude-ai-agent
+    name: dranytech-trading-agent
     runtime: python
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     plan: starter
+    healthCheckPath: /status
     envVars:
       - key: BINANCE_API_KEY
         sync: false
@@ -16,5 +17,4 @@ services:
       - key: TESTNET
         value: "false"
       - key: PORT
-        value: "5000"
-    healthCheckPath: /status
+        value: "10000"

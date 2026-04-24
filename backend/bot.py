@@ -402,5 +402,5 @@ if __name__ == "__main__":
     print("  Binance Claude AI Agent — Render-Ready Backend")
     print("=" * 55)
     threading.Thread(target=try_auto_connect, daemon=True).start()
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
