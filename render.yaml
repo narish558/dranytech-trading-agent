@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: binance-claude-ai-agent
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: starter
+    envVars:
+      - key: BINANCE_API_KEY
+        sync: false
+      - key: BINANCE_API_SECRET
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: TESTNET
+        value: "false"
+      - key: PORT
+        value: "5000"
+    healthCheckPath: /status
