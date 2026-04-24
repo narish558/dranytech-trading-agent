@@ -51,7 +51,7 @@ SPOT_TEST    = "https://testnet.binance.vision"
 FUTURES_TEST = "https://testnet.binancefuture.com"
 
 ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL  = "claude-opus-4-6"
+CLAUDE_MODEL  = "claude-opus-4-5"
 
 AI_SYSTEM = """You are an expert cryptocurrency trading AI agent managing a real Binance account.
 Analyze live market data and decide BUY, SELL, or HOLD for each asset.
