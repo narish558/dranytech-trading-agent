@@ -402,7 +402,18 @@ def agent_runner():
     for t in threads:
         t.join()
 
+def get_my_ip():
+    try:
+        r = requests.get("https://api.ipify.org?format=json", timeout=5)
+        ip = r.json().get("ip", "unknown")
+        log(f">>> RENDER OUTBOUND IP: {ip} <<< (add this to Binance whitelist)", "ok")
+        return ip
+    except Exception:
+        log("Could not detect outbound IP.", "warn")
+        return None
+
 def try_auto_connect():
+    get_my_ip()
     if state["api_key"] and state["api_secret"]:
         try:
             r = signed_request("GET", "spot", "/api/v3/account")
